@@ -13,11 +13,11 @@ app = Flask(__name__)
 CORS(app)
 
 # Configuration
-MQTT_BROKER = "localhost"  # Change to your MQTT broker
+MQTT_BROKER = "mqtt://alderaan.software-engineering.ie"  # Change to your MQTT broker
 MQTT_PORT = 1883
-MQTT_TOPIC_STATUS = "boltlock/status"
-MQTT_TOPIC_COMMAND = "boltlock/command"
-MQTT_TOPIC_EVENTS = "boltlock/events"
+MQTT_TOPIC_STATUS = "BoltLock/status"
+MQTT_TOPIC_COMMAND = "BoltLock/command"
+MQTT_TOPIC_EVENTS = "BoltLock/events"
 
 # Device state
 device_state = {
@@ -34,6 +34,45 @@ MAX_EVENTS = 100
 # MQTT Client
 mqtt_client = None
 mqtt_connected = False
+
+
+def _parse_event_message(payload):
+    """
+    Parse event message from device.
+    Supports both formats:
+    1. JSON: {"event_type": "LOCK", "description": "...", "device_id": "..."}
+    2. Text: *BoltLock Alert*\n*Event:* LOCK\n*Details:* [...]\n*Time:* [timestamp]
+    """
+    try:
+        # Try JSON format first
+        data = json.loads(payload)
+        if "event_type" in data:
+            return (
+                data.get("event_type"),
+                data.get("description", ""),
+                data.get("device_id"),
+            )
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Try text format
+    try:
+        lines = payload.split("\n")
+        event_type = None
+        description = None
+        
+        for line in lines:
+            if "*Event:*" in line:
+                event_type = line.split("*Event:*")[1].strip()
+            elif "*Details:*" in line:
+                description = line.split("*Details:*")[1].strip()
+        
+        if event_type:
+            return event_type, description or "", None
+    except Exception as e:
+        print(f"[MQTT] Error parsing event message: {e}")
+
+    return None, None, None
 
 
 # Database initialization
@@ -118,26 +157,25 @@ def on_message(client, userdata, msg):
         print(f"[MQTT] Received on {topic}: {payload}")
 
         if topic == MQTT_TOPIC_STATUS:
-            # Update device state
-            data = json.loads(payload)
-            device_state.update(
-                {
-                    "lock_state": data.get("lock_state", device_state["lock_state"]),
-                    "door_state": data.get("door_state", device_state["door_state"]),
-                    "wifi_connected": data.get("wifi_connected", True),
-                    "device_id": data.get("device_id"),
-                    "last_update": datetime.now().isoformat(),
-                }
-            )
+            # Update device state - handle simple status format
+            try:
+                data = json.loads(payload)
+                # Device sends {"status": "online"} or similar status messages
+                if "status" in data:
+                    device_state["wifi_connected"] = data.get("status") == "online"
+                # Also handle lock/door state if provided
+                device_state.update({k: v for k, v in data.items() 
+                                    if k in ["lock_state", "door_state", "device_id"]})
+                device_state["last_update"] = datetime.now().isoformat()
+            except json.JSONDecodeError:
+                print(f"[MQTT] Invalid JSON in status message")
 
         elif topic == MQTT_TOPIC_EVENTS:
-            # Log event
-            event = json.loads(payload)
-            log_event(
-                event.get("event_type", "UNKNOWN"),
-                event.get("description", ""),
-                event.get("device_id"),
-            )
+            # Parse event from device format
+            # Expected format: *BoltLock Alert*\n*Event:* LOCK\n*Details:* [description]\n*Time:* [unix timestamp]
+            event_type, description, device_id = _parse_event_message(payload)
+            if event_type:
+                log_event(event_type, description, device_id)
 
     except Exception as e:
         print(f"[MQTT] Error processing message: {e}")

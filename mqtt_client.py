@@ -29,6 +29,44 @@ class BoltLockMQTTClient:
         if event_type in self.callbacks:
             self.callbacks[event_type] = callback
 
+    def _parse_event(self, payload):
+        """
+        Parse event message from device.
+        Supports both formats:
+        1. JSON: {"event_type": "LOCK", "description": "...", "device_id": "..."}
+        2. Text: *BoltLock Alert*\n*Event:* LOCK\n*Details:* [...]\n*Time:* [timestamp]
+        """
+        try:
+            # Try JSON format first
+            data = json.loads(payload)
+            if "event_type" in data:
+                return data
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Try text format
+        try:
+            lines = payload.split("\n")
+            event_type = None
+            description = None
+            
+            for line in lines:
+                if "*Event:*" in line:
+                    event_type = line.split("*Event:*")[1].strip()
+                elif "*Details:*" in line:
+                    description = line.split("*Details:*")[1].strip()
+            
+            if event_type:
+                return {
+                    "event_type": event_type,
+                    "description": description or "",
+                    "device_id": None
+                }
+        except Exception as e:
+            print(f"[MQTT] Error parsing event message: {e}")
+
+        return None
+
     def on_connect(self, client, userdata, flags, rc):
         """MQTT connection callback"""
         if rc == 0:
@@ -66,13 +104,15 @@ class BoltLockMQTTClient:
             from config import MQTT_TOPIC_EVENTS, MQTT_TOPIC_STATUS
 
             if topic == MQTT_TOPIC_STATUS:
+                # Handle status format: {"status": "online"} or with state info
                 data = json.loads(payload)
                 if self.callbacks["on_status"]:
                     self.callbacks["on_status"](data)
 
             elif topic == MQTT_TOPIC_EVENTS:
-                event = json.loads(payload)
-                if self.callbacks["on_event"]:
+                # Parse event - support both JSON and text formats
+                event = self._parse_event(payload)
+                if event and self.callbacks["on_event"]:
                     self.callbacks["on_event"](event)
 
         except Exception as e:

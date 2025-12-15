@@ -73,7 +73,7 @@ class BoltLockMQTTClient:
             print(f"[MQTT] Connected to broker at {self.broker}:{self.port}")
             self.connected = True
             # Subscribe to topics
-            from config import MQTT_TOPIC_EVENTS, MQTT_TOPIC_STATUS
+            from config.settings import MQTT_TOPIC_EVENTS, MQTT_TOPIC_STATUS
 
             client.subscribe(MQTT_TOPIC_STATUS)
             client.subscribe(MQTT_TOPIC_EVENTS)
@@ -101,7 +101,7 @@ class BoltLockMQTTClient:
 
             print(f"[MQTT] Received on {topic}: {payload}")
 
-            from config import MQTT_TOPIC_EVENTS, MQTT_TOPIC_STATUS
+            from config.settings import MQTT_TOPIC_EVENTS, MQTT_TOPIC_STATUS
 
             if topic == MQTT_TOPIC_STATUS:
                 # Handle status format: {"status": "online"} or with state info
@@ -149,7 +149,7 @@ class BoltLockMQTTClient:
             print("[MQTT] Cannot publish - not connected")
             return False
 
-        from config import MQTT_TOPIC_COMMAND
+        from config.settings import MQTT_TOPIC_COMMAND
 
         command = {"action": action, "timestamp": datetime.now().isoformat(), **kwargs}
 

@@ -1,15 +1,6 @@
 -- BoltLock Cloud Backend Database Schema
 -- Compatible with SQLite and PostgreSQL
 
--- Users table for authentication
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username VARCHAR(255) UNIQUE NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    api_key VARCHAR(255) UNIQUE NOT NULL,
-    created_at VARCHAR(255) NOT NULL
-);
-
 -- Devices table for registered devices
 CREATE TABLE IF NOT EXISTS devices (
     id VARCHAR(255) PRIMARY KEY,
@@ -41,5 +32,4 @@ CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_device_id ON events(device_id);
 CREATE INDEX IF NOT EXISTS idx_state_history_timestamp ON state_history(timestamp);
 CREATE INDEX IF NOT EXISTS idx_state_history_device_id ON state_history(device_id);
-CREATE INDEX IF NOT EXISTS idx_users_username ON users(username);
 CREATE INDEX IF NOT EXISTS idx_devices_registered_at ON devices(registered_at);

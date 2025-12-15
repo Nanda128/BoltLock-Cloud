@@ -19,15 +19,7 @@ MQTT_TOPIC_STATUS = os.environ.get("BOLTLOCK_TOPIC_STATUS", "BoltLock/status")
 MQTT_TOPIC_COMMAND = os.environ.get("BOLTLOCK_TOPIC_COMMAND", "BoltLock/command")
 MQTT_TOPIC_EVENTS = os.environ.get("BOLTLOCK_TOPIC_EVENTS", "BoltLock/events")
 
-# -----------------------------
-# Server Configuration
-# -----------------------------
-SERVER_HOST = os.environ.get("BOLTLOCK_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("BOLTLOCK_PORT", "5000"))
-
-# -----------------------------
-# Database (no sudo)
-# -----------------------------
+# Database
 # Store under the user's home directory
 DB_DIR = Path(os.environ.get("BOLTLOCK_DB_DIR", Path.home() / ".local" / "share" / "boltlock"))
 DB_DIR.mkdir(parents=True, exist_ok=True)
@@ -35,7 +27,3 @@ DB_DIR.mkdir(parents=True, exist_ok=True)
 DATABASE_PATH = DB_DIR / "boltlock.db"
 SQLALCHEMY_DATABASE_URI = f"sqlite:///{DATABASE_PATH}"
 
-# -----------------------------
-# Security
-# -----------------------------
-SECRET_KEY = os.environ.get("BOLTLOCK_SECRET_KEY", "boltlock")

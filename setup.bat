@@ -54,7 +54,6 @@ echo   curl http://localhost:5000/
 echo.
 echo Next steps:
 echo 1. Configure MQTT broker in config.py
-echo 2. Register a user via API
-echo 3. Update ESP32 firmware with MQTT credentials
+echo 2. Update ESP32 firmware with MQTT credentials
 echo.
 pause

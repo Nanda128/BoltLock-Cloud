@@ -1,25 +1,41 @@
 import hashlib
 import json
 import secrets
-import sqlite3
 from datetime import datetime
 from functools import wraps
 
 import paho.mqtt.client as mqtt
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, render_template, send_from_directory
 from flask_cors import CORS
 
+from config import (
+    MQTT_BROKER_HOST,
+    MQTT_PORT,
+    MQTT_USERNAME,
+    MQTT_PASSWORD,
+    MQTT_TOPIC_STATUS,
+    MQTT_TOPIC_COMMAND,
+    MQTT_TOPIC_EVENTS,
+    SERVER_HOST,
+    SERVER_PORT,
+    SQLALCHEMY_DATABASE_URI,
+)
+from models import db, Event, User, Device, StateHistory
+
 app = Flask(__name__)
+app.config["SQLALCHEMY_DATABASE_URI"] = SQLALCHEMY_DATABASE_URI
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+
+# SQLite tends to lock under concurrent writes; these options reduce pain.
+app.config["SQLALCHEMY_ENGINE_OPTIONS"] = {
+    "connect_args": {"check_same_thread": False},
+    "pool_pre_ping": True,
+}
+
+db.init_app(app)
 CORS(app)
 
-# Configuration
-MQTT_BROKER = "mqtt://alderaan.software-engineering.ie"  # Change to your MQTT broker
-MQTT_PORT = 1883
-MQTT_TOPIC_STATUS = "BoltLock/status"
-MQTT_TOPIC_COMMAND = "BoltLock/command"
-MQTT_TOPIC_EVENTS = "BoltLock/events"
-
-# Device state
+# Device state (in-memory snapshot for /api/status)
 device_state = {
     "lock_state": "LOCKED",
     "door_state": "CLOSED",
@@ -31,21 +47,28 @@ device_state = {
 events_buffer = []
 MAX_EVENTS = 100
 
-# MQTT Client
 mqtt_client = None
 mqtt_connected = False
 
 
-def _parse_event_message(payload):
+def _parse_event_message(payload: str):
     """
     Parse event message from device.
-    Supports both formats:
-    1. JSON: {"event_type": "LOCK", "description": "...", "device_id": "..."}
+    Supports multiple formats:
+    1. JSON: {"event": "LOCK", "trigger": "button"} or {"event_type": "LOCK", "description": "..."}
     2. Text: *BoltLock Alert*\n*Event:* LOCK\n*Details:* [...]\n*Time:* [timestamp]
     """
     try:
-        # Try JSON format first
         data = json.loads(payload)
+        
+        # Handle BoltLock firmware format: {"event": "lock", "trigger": "button"}
+        if "event" in data:
+            event_type = data.get("event", "").upper()
+            trigger = data.get("trigger", "unknown")
+            description = f"Event triggered by: {trigger}"
+            return event_type, description, data.get("device_id")
+        
+        # Handle alternative format: {"event_type": "LOCK", "description": "..."}
         if "event_type" in data:
             return (
                 data.get("event_type"),
@@ -55,18 +78,17 @@ def _parse_event_message(payload):
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Try text format
     try:
         lines = payload.split("\n")
         event_type = None
         description = None
-        
+
         for line in lines:
             if "*Event:*" in line:
                 event_type = line.split("*Event:*")[1].strip()
             elif "*Details:*" in line:
                 description = line.split("*Details:*")[1].strip()
-        
+
         if event_type:
             return event_type, description or "", None
     except Exception as e:
@@ -75,38 +97,12 @@ def _parse_event_message(payload):
     return None, None, None
 
 
-# Database initialization
 def init_db():
-    conn = sqlite3.connect("boltlock.db")
-    c = conn.cursor()
-
-    # Events table
-    c.execute("""CREATE TABLE IF NOT EXISTS events
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT,
-                  event_type TEXT,
-                  description TEXT,
-                  device_id TEXT)""")
-
-    # Users table for authentication
-    c.execute("""CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE,
-                  password_hash TEXT,
-                  api_key TEXT UNIQUE)""")
-
-    # Device table
-    c.execute("""CREATE TABLE IF NOT EXISTS devices
-                 (id TEXT PRIMARY KEY,
-                  name TEXT,
-                  registered_at TEXT,
-                  last_seen TEXT)""")
-
-    conn.commit()
-    conn.close()
+    with app.app_context():
+        db.create_all()
+        print("[DB] Database initialised")
 
 
-# Authentication decorator
 def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -114,12 +110,7 @@ def require_auth(f):
         if not api_key:
             return jsonify({"error": "Missing API key"}), 401
 
-        conn = sqlite3.connect("boltlock.db")
-        c = conn.cursor()
-        c.execute("SELECT id FROM users WHERE api_key = ?", (api_key,))
-        user = c.fetchone()
-        conn.close()
-
+        user = User.query.filter_by(api_key=api_key).first()
         if not user:
             return jsonify({"error": "Invalid API key"}), 401
 
@@ -128,19 +119,17 @@ def require_auth(f):
     return decorated_function
 
 
-# MQTT Callbacks
 def on_connect(client, userdata, flags, rc):
     global mqtt_connected
     if rc == 0:
-        print(f"[MQTT] Connected to broker at {MQTT_BROKER}:{MQTT_PORT}")
         mqtt_connected = True
-        # Subscribe to device topics
+        print(f"[MQTT] Connected to broker at {MQTT_BROKER_HOST}:{MQTT_PORT}")
         client.subscribe(MQTT_TOPIC_STATUS)
         client.subscribe(MQTT_TOPIC_EVENTS)
         print(f"[MQTT] Subscribed to {MQTT_TOPIC_STATUS} and {MQTT_TOPIC_EVENTS}")
     else:
-        print(f"[MQTT] Connection failed with code {rc}")
         mqtt_connected = False
+        print(f"[MQTT] Connection failed with code {rc}")
 
 
 def on_disconnect(client, userdata, rc):
@@ -149,30 +138,66 @@ def on_disconnect(client, userdata, rc):
     print(f"[MQTT] Disconnected from broker (code: {rc})")
 
 
+def _register_or_touch_device(device_id: str):
+    ts = datetime.now().isoformat()
+    device = Device.query.filter_by(id=device_id).first()
+    if device:
+        device.last_seen = ts
+    else:
+        device = Device(id=device_id, name=device_id, registered_at=ts, last_seen=ts)
+        db.session.add(device)
+
+
+def _log_state_history(device_id: str | None, lock_state: str | None, door_state: str | None):
+    if not device_id:
+        return
+    ts = datetime.now().isoformat()
+    db.session.add(
+        StateHistory(
+            timestamp=ts,
+            device_id=device_id,
+            lock_state=lock_state,
+            door_state=door_state,
+        )
+    )
+
+
 def on_message(client, userdata, msg):
     try:
-        payload = msg.payload.decode("utf-8")
+        payload = msg.payload.decode("utf-8", errors="replace")
         topic = msg.topic
 
         print(f"[MQTT] Received on {topic}: {payload}")
 
         if topic == MQTT_TOPIC_STATUS:
-            # Update device state - handle simple status format
             try:
                 data = json.loads(payload)
-                # Device sends {"status": "online"} or similar status messages
+
+                # Update in-memory state
                 if "status" in data:
-                    device_state["wifi_connected"] = data.get("status") == "online"
-                # Also handle lock/door state if provided
-                device_state.update({k: v for k, v in data.items() 
-                                    if k in ["lock_state", "door_state", "device_id"]})
+                    device_state["wifi_connected"] = (data.get("status") == "online")
+
+                for k in ["lock_state", "door_state", "device_id", "wifi_connected"]:
+                    if k in data:
+                        device_state[k] = data[k]
+
                 device_state["last_update"] = datetime.now().isoformat()
+
+                # Persist status to DB
+                with app.app_context():
+                    device_id = data.get("device_id")
+                    lock_state = data.get("lock_state")
+                    door_state = data.get("door_state")
+
+                    if device_id:
+                        _register_or_touch_device(device_id)
+                        _log_state_history(device_id, lock_state, door_state)
+                        db.session.commit()
+
             except json.JSONDecodeError:
-                print(f"[MQTT] Invalid JSON in status message")
+                print("[MQTT] Invalid JSON in status message")
 
         elif topic == MQTT_TOPIC_EVENTS:
-            # Parse event from device format
-            # Expected format: *BoltLock Alert*\n*Event:* LOCK\n*Details:* [description]\n*Time:* [unix timestamp]
             event_type, description, device_id = _parse_event_message(payload)
             if event_type:
                 log_event(event_type, description, device_id)
@@ -183,30 +208,27 @@ def on_message(client, userdata, msg):
 
 def log_event(event_type, description, device_id=None):
     timestamp = datetime.now().isoformat()
-    event = {
-        "timestamp": timestamp,
-        "event_type": event_type,
-        "description": description,
-        "device_id": device_id,
-    }
+    event = Event(
+        timestamp=timestamp,
+        event_type=event_type,
+        description=description,
+        device_id=device_id,
+    )
 
-    # Add to buffer
-    events_buffer.append(event)
+    events_buffer.append(event.to_dict())
     if len(events_buffer) > MAX_EVENTS:
         events_buffer.pop(0)
 
-    # Save to database
     try:
-        conn = sqlite3.connect("boltlock.db")
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO events (timestamp, event_type, description, device_id) VALUES (?, ?, ?, ?)",
-            (timestamp, event_type, description, device_id),
-        )
-        conn.commit()
-        conn.close()
+        with app.app_context():
+            if device_id:
+                _register_or_touch_device(device_id)
+            db.session.add(event)
+            db.session.commit()
     except Exception as e:
         print(f"[DB] Error saving event: {e}")
+        with app.app_context():
+            db.session.rollback()
 
 
 def init_mqtt():
@@ -216,16 +238,16 @@ def init_mqtt():
     mqtt_client.on_disconnect = on_disconnect
     mqtt_client.on_message = on_message
 
+    if MQTT_USERNAME and MQTT_PASSWORD:
+        mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+
     try:
-        mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.connect(MQTT_BROKER_HOST, MQTT_PORT, 60)
         mqtt_client.loop_start()
-        print(f"[MQTT] Connecting to {MQTT_BROKER}:{MQTT_PORT}...")
+        print(f"[MQTT] Connecting to {MQTT_BROKER_HOST}:{MQTT_PORT}...")
     except Exception as e:
         print(f"[MQTT] Failed to connect: {e}")
         print("[MQTT] Server will run without MQTT. Check broker configuration.")
-
-
-# REST API Routes
 
 
 @app.route("/")
@@ -278,88 +300,114 @@ def unlock_door():
 @require_auth
 def get_events():
     limit = request.args.get("limit", 50, type=int)
-
-    conn = sqlite3.connect("boltlock.db")
-    c = conn.cursor()
-    c.execute(
-        "SELECT timestamp, event_type, description, device_id FROM events ORDER BY id DESC LIMIT ?",
-        (limit,),
-    )
-    events = [
-        {
-            "timestamp": row[0],
-            "event_type": row[1],
-            "description": row[2],
-            "device_id": row[3],
-        }
-        for row in c.fetchall()
-    ]
-    conn.close()
-
-    return jsonify({"success": True, "data": events})
+    events = Event.query.order_by(Event.id.desc()).limit(limit).all()
+    return jsonify({"success": True, "data": [e.to_dict() for e in events]})
 
 
 @app.route("/api/auth/register", methods=["POST"])
 def register():
-    data = request.get_json()
+    data = request.get_json() or {}
     username = data.get("username")
     password = data.get("password")
 
     if not username or not password:
-        return jsonify(
-            {"success": False, "error": "Username and password required"}
-        ), 400
+        return jsonify({"success": False, "error": "Username and password required"}), 400
 
     password_hash = hashlib.sha256(password.encode()).hexdigest()
     api_key = secrets.token_urlsafe(32)
 
     try:
-        conn = sqlite3.connect("boltlock.db")
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO users (username, password_hash, api_key) VALUES (?, ?, ?)",
-            (username, password_hash, api_key),
+        user = User(
+            username=username,
+            password_hash=password_hash,
+            api_key=api_key,
+            created_at=datetime.now().isoformat(),
         )
-        conn.commit()
-        conn.close()
-
+        db.session.add(user)
+        db.session.commit()
         return jsonify({"success": True, "api_key": api_key})
-    except sqlite3.IntegrityError:
-        return jsonify({"success": False, "error": "Username already exists"}), 409
+    except Exception as e:
+        db.session.rollback()
+        if "username" in str(e).lower():
+            return jsonify({"success": False, "error": "Username already exists"}), 409
+        return jsonify({"success": False, "error": str(e)}), 400
 
 
 @app.route("/api/auth/login", methods=["POST"])
 def login():
-    data = request.get_json()
+    data = request.get_json() or {}
     username = data.get("username")
     password = data.get("password")
 
     if not username or not password:
-        return jsonify(
-            {"success": False, "error": "Username and password required"}
-        ), 400
+        return jsonify({"success": False, "error": "Username and password required"}), 400
 
     password_hash = hashlib.sha256(password.encode()).hexdigest()
+    user = User.query.filter_by(username=username, password_hash=password_hash).first()
 
-    conn = sqlite3.connect("boltlock.db")
-    c = conn.cursor()
-    c.execute(
-        "SELECT api_key FROM users WHERE username = ? AND password_hash = ?",
-        (username, password_hash),
-    )
-    result = c.fetchone()
-    conn.close()
+    if user:
+        return jsonify({"success": True, "api_key": user.api_key})
+    return jsonify({"success": False, "error": "Invalid credentials"}), 401
 
-    if result:
-        return jsonify({"success": True, "api_key": result[0]})
-    else:
-        return jsonify({"success": False, "error": "Invalid credentials"}), 401
+
+@app.route("/dashboard")
+def dashboard():
+    """Main dashboard page"""
+    return render_template("dashboard.html")
+
+
+@app.route("/api/dashboard/status")
+def api_dashboard_status():
+    """Get current system status for dashboard (no auth required for basic view)"""
+    return jsonify({
+        "success": True,
+        "device_state": device_state,
+        "mqtt_connected": mqtt_connected,
+        "events_buffered": len(events_buffer),
+    })
+
+
+@app.route("/api/dashboard/events", methods=["GET"])
+def api_dashboard_events():
+    """Get recent events for dashboard display"""
+    limit = request.args.get("limit", 20, type=int)
+    events = Event.query.order_by(Event.id.desc()).limit(limit).all()
+    return jsonify({
+        "success": True,
+        "data": [e.to_dict() for e in reversed(events)]
+    })
+
+
+@app.route("/api/dashboard/state-history", methods=["GET"])
+def api_dashboard_state_history():
+    """Get lock state history for dashboard"""
+    device_id = request.args.get("device_id")
+    limit = request.args.get("limit", 50, type=int)
+    
+    query = StateHistory.query.order_by(StateHistory.id.desc()).limit(limit)
+    if device_id:
+        query = query.filter_by(device_id=device_id)
+    
+    states = query.all()
+    return jsonify({
+        "success": True,
+        "data": [s.to_dict() for s in reversed(states)]
+    })
+
+
+@app.route("/api/dashboard/devices", methods=["GET"])
+def api_dashboard_devices():
+    """Get registered devices"""
+    devices = Device.query.all()
+    return jsonify({
+        "success": True,
+        "data": [d.to_dict() for d in devices]
+    })
 
 
 if __name__ == "__main__":
-    print("[SERVER] Initializing BoltLock Cloud Backend...")
+    print("[SERVER] Initialising BoltLock Cloud Backend...")
     init_db()
-    print("[DB] Database initialized")
     init_mqtt()
-    print("[SERVER] Starting Flask server on port 5000...")
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    print(f"[SERVER] Starting Flask server on {SERVER_HOST}:{SERVER_PORT}...")
+    app.run(host=SERVER_HOST, port=SERVER_PORT, debug=False)

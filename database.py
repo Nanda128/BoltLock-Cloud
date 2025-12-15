@@ -1,52 +1,18 @@
 """
 Database Module for BoltLock
-Handles all database operations
+Handles all database operations using SQLAlchemy ORM
 """
 
-import sqlite3
 from datetime import datetime
 
 from config import DATABASE_PATH
+from models import db, Event, User, Device, StateHistory
 
 
 def init_db():
     """Initialize the database with required tables"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-
-    # Events table
-    c.execute("""CREATE TABLE IF NOT EXISTS events
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT NOT NULL,
-                  event_type TEXT NOT NULL,
-                  description TEXT,
-                  device_id TEXT)""")
-
-    # Users table for authentication
-    c.execute("""CREATE TABLE IF NOT EXISTS users
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  username TEXT UNIQUE NOT NULL,
-                  password_hash TEXT NOT NULL,
-                  api_key TEXT UNIQUE NOT NULL,
-                  created_at TEXT NOT NULL)""")
-
-    # Devices table
-    c.execute("""CREATE TABLE IF NOT EXISTS devices
-                 (id TEXT PRIMARY KEY,
-                  name TEXT,
-                  registered_at TEXT NOT NULL,
-                  last_seen TEXT)""")
-
-    # Device state history
-    c.execute("""CREATE TABLE IF NOT EXISTS state_history
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp TEXT NOT NULL,
-                  device_id TEXT,
-                  lock_state TEXT,
-                  door_state TEXT)""")
-
-    conn.commit()
-    conn.close()
+    # This will be called from app.py context
+    db.create_all()
     print("[DB] Database initialized")
 
 
@@ -55,48 +21,31 @@ def log_event(event_type, description, device_id=None):
     timestamp = datetime.now().isoformat()
 
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO events (timestamp, event_type, description, device_id) VALUES (?, ?, ?, ?)",
-            (timestamp, event_type, description, device_id),
+        event = Event(
+            timestamp=timestamp,
+            event_type=event_type,
+            description=description,
+            device_id=device_id,
         )
-        conn.commit()
-        conn.close()
+        db.session.add(event)
+        db.session.commit()
         return True
     except Exception as e:
         print(f"[DB] Error saving event: {e}")
+        db.session.rollback()
         return False
 
 
 def get_events(limit=50, device_id=None):
     """Retrieve recent events from the database"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-
+    query = Event.query.order_by(Event.id.desc())
+    
     if device_id:
-        c.execute(
-            "SELECT timestamp, event_type, description, device_id FROM events WHERE device_id = ? ORDER BY id DESC LIMIT ?",
-            (device_id, limit),
-        )
-    else:
-        c.execute(
-            "SELECT timestamp, event_type, description, device_id FROM events ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-
-    events = [
-        {
-            "timestamp": row[0],
-            "event_type": row[1],
-            "description": row[2],
-            "device_id": row[3],
-        }
-        for row in c.fetchall()
-    ]
-    conn.close()
-
-    return events
+        query = query.filter_by(device_id=device_id)
+    
+    events = query.limit(limit).all()
+    
+    return [event.to_dict() for event in events]
 
 
 def create_user(username, password_hash, api_key):
@@ -104,45 +53,36 @@ def create_user(username, password_hash, api_key):
     timestamp = datetime.now().isoformat()
 
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO users (username, password_hash, api_key, created_at) VALUES (?, ?, ?, ?)",
-            (username, password_hash, api_key, timestamp),
+        user = User(
+            username=username,
+            password_hash=password_hash,
+            api_key=api_key,
+            created_at=timestamp,
         )
-        conn.commit()
-        conn.close()
+        db.session.add(user)
+        db.session.commit()
         return True
-    except sqlite3.IntegrityError:
+    except Exception as e:
+        print(f"[DB] Error creating user: {e}")
+        db.session.rollback()
         return False
 
 
 def get_user_by_api_key(api_key):
     """Get user by API key"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, username FROM users WHERE api_key = ?", (api_key,))
-    result = c.fetchone()
-    conn.close()
+    user = User.query.filter_by(api_key=api_key).first()
 
-    if result:
-        return {"id": result[0], "username": result[1]}
+    if user:
+        return {"id": user.id, "username": user.username}
     return None
 
 
 def get_user_by_credentials(username, password_hash):
     """Get user by username and password"""
-    conn = sqlite3.connect(DATABASE_PATH)
-    c = conn.cursor()
-    c.execute(
-        "SELECT id, api_key FROM users WHERE username = ? AND password_hash = ?",
-        (username, password_hash),
-    )
-    result = c.fetchone()
-    conn.close()
+    user = User.query.filter_by(username=username, password_hash=password_hash).first()
 
-    if result:
-        return {"id": result[0], "api_key": result[1]}
+    if user:
+        return {"id": user.id, "api_key": user.api_key}
     return None
 
 
@@ -151,17 +91,23 @@ def register_device(device_id, name):
     timestamp = datetime.now().isoformat()
 
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT OR REPLACE INTO devices (id, name, registered_at, last_seen) VALUES (?, ?, ?, ?)",
-            (device_id, name, timestamp, timestamp),
-        )
-        conn.commit()
-        conn.close()
+        device = Device.query.filter_by(id=device_id).first()
+        if device:
+            device.name = name
+            device.last_seen = timestamp
+        else:
+            device = Device(
+                id=device_id,
+                name=name,
+                registered_at=timestamp,
+                last_seen=timestamp,
+            )
+            db.session.add(device)
+        db.session.commit()
         return True
     except Exception as e:
         print(f"[DB] Error registering device: {e}")
+        db.session.rollback()
         return False
 
 
@@ -170,16 +116,15 @@ def update_device_last_seen(device_id):
     timestamp = datetime.now().isoformat()
 
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(
-            "UPDATE devices SET last_seen = ? WHERE id = ?", (timestamp, device_id)
-        )
-        conn.commit()
-        conn.close()
-        return True
+        device = Device.query.filter_by(id=device_id).first()
+        if device:
+            device.last_seen = timestamp
+            db.session.commit()
+            return True
+        return False
     except Exception as e:
         print(f"[DB] Error updating device: {e}")
+        db.session.rollback()
         return False
 
 
@@ -188,15 +133,16 @@ def log_state_change(device_id, lock_state, door_state):
     timestamp = datetime.now().isoformat()
 
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO state_history (timestamp, device_id, lock_state, door_state) VALUES (?, ?, ?, ?)",
-            (timestamp, device_id, lock_state, door_state),
+        state = StateHistory(
+            timestamp=timestamp,
+            device_id=device_id,
+            lock_state=lock_state,
+            door_state=door_state,
         )
-        conn.commit()
-        conn.close()
+        db.session.add(state)
+        db.session.commit()
         return True
     except Exception as e:
         print(f"[DB] Error logging state change: {e}")
+        db.session.rollback()
         return False
